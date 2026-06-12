@@ -56,7 +56,6 @@ jobs:
           - os: macos-15
             artifact-name: macOS
             architecture: x64
-            gradle-args: "-x :wpilib_interface:test"
           - os: ubuntu-latest
             artifact-name: ubuntu
             architecture: x64
