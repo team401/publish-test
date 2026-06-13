@@ -38,6 +38,7 @@ jobs:
         run: |
           ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache \
             -PRELEASE_SIGNING_ENABLED=true \
+            -PsignAllPublications=true \
             -Pversion="${{ steps.version.outputs.version }}" \
             --console=plain \
             2>&1 | tee publish_output.txt
