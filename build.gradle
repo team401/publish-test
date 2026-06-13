@@ -112,6 +112,7 @@ subprojects {
         configure(new com.vanniktech.maven.publish.JavaLibrary(
         	new com.vanniktech.maven.publish.JavadocJar.Javadoc(), true))
     	publishToMavenCentral()   // Central Portal is now the default, no argument needed
+		signAllPublications()
 
         // Project release information.
         coordinates(group, project.name, version)
