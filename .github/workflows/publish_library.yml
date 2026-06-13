@@ -8,10 +8,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v5
         with:
-          submodules: true
           fetch-depth: 0
 
       - name: Set up Java
@@ -23,64 +23,303 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Publish package
         id: publish
         run: |
-          ./gradlew publishAndReleaseToMavenCentral \
-            --no-configuration-cache \
+          ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache \
             -PRELEASE_SIGNING_ENABLED=true \
+            -Pversion="${{ steps.version.outputs.version }}" \
+            --console=plain \
             2>&1 | tee publish_output.txt
           exit ${PIPESTATUS[0]}
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALUSERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALPASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.ORG_GRADLE_PROJECT_SIGNINGINMEMORYKEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.ORG_GRADLE_PROJECT_SIGNINGINMEMORYKEYPASSWORD }}
+
+      # The vanniktech plugin prints the deployment ID during upload.
+      # Extract it so we can poll the Central Portal status API directly,
+      # which gives us the real outcome (PUBLISHED vs FAILED + error details)
+      # rather than relying on Gradle's exit code alone.
+      - name: Extract deployment ID from Gradle output
+        id: deployment
+        if: always()
+        run: |
+          # The vanniktech plugin logs a line like:
+          # "Created deployment 'abcd1234-...' for ..."
+          # or the upload response body is the raw UUID on one line.
+          DEPLOYMENT_ID=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' publish_output.txt | head -1)
+          if [ -z "$DEPLOYMENT_ID" ]; then
+            echo "No deployment ID found in Gradle output - publish may have failed before upload."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Deployment ID: $DEPLOYMENT_ID"
+            echo "id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Poll Central Portal for deployment status
+        id: central
+        if: always() && steps.deployment.outputs.found == 'true'
+        run: |
+          AUTH=$(printf "${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALUSERNAME }}:${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALPASSWORD }}" | base64 -w 0)
+          DEPLOYMENT_ID="${{ steps.deployment.outputs.id }}"
+
+          echo "Polling Central Portal for deployment $DEPLOYMENT_ID..."
+
+          # Poll until we get a terminal state (PUBLISHED or FAILED),
+          # or time out after ~10 minutes (20 attempts x 30s).
+          FINAL_STATE=""
+          ERRORS=""
+          PURLS=""
+
+          for i in $(seq 1 20); do
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer $AUTH" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=$DEPLOYMENT_ID")
+
+            echo "Attempt $i: $RESPONSE"
+
+            STATE=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('deploymentState','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
+
+            if [ "$STATE" = "PUBLISHED" ] || [ "$STATE" = "FAILED" ]; then
+              FINAL_STATE="$STATE"
+              ERRORS=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          errors = d.get('errors', {})
+          if isinstance(errors, dict):
+              for k, v in errors.items():
+                  print(f'- {k}: {v}')
+          elif isinstance(errors, list):
+              for e in errors:
+                  print(f'- {e}')
+          " 2>/dev/null || echo "")
+              PURLS=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          for p in d.get('purls', []):
+              print(p)
+          " 2>/dev/null || echo "")
+              break
+            fi
+
+            echo "State is $STATE, waiting 30s..."
+            sleep 30
+          done
+
+          if [ -z "$FINAL_STATE" ]; then
+            FINAL_STATE="TIMEOUT"
+          fi
+
+          echo "state=$FINAL_STATE" >> "$GITHUB_OUTPUT"
+
+          # Write errors and purls to files to pass to later steps
+          echo "$ERRORS" > central_errors.txt
+          echo "$PURLS" > central_purls.txt
+
+          echo "Final state: $FINAL_STATE"
+          [ -n "$ERRORS" ] && echo "Errors: $ERRORS"
+          [ -n "$PURLS" ] && echo "Published: $PURLS"
+
+      - name: Determine overall result
+        id: result
+        if: always()
+        run: |
+          GRADLE_OK="${{ steps.publish.outcome }}"
+          CENTRAL_STATE="${{ steps.central.outputs.state }}"
+          DEPLOYMENT_FOUND="${{ steps.deployment.outputs.found }}"
+
+          if [ "$GRADLE_OK" = "success" ] && [ "$CENTRAL_STATE" = "PUBLISHED" ]; then
+            echo "value=success" >> "$GITHUB_OUTPUT"
+          elif [ "$DEPLOYMENT_FOUND" = "false" ] || [ "$GRADLE_OK" != "success" ]; then
+            echo "value=gradle_failure" >> "$GITHUB_OUTPUT"
+          elif [ "$CENTRAL_STATE" = "FAILED" ]; then
+            echo "value=central_failure" >> "$GITHUB_OUTPUT"
+          elif [ "$CENTRAL_STATE" = "TIMEOUT" ]; then
+            echo "value=timeout" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=unknown" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Write job summary
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "## ✅ Maven Central Publish Succeeded" >> $GITHUB_STEP_SUMMARY
-            echo "Published successfully. Allow up to 30 min to appear in search." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "## ❌ Maven Central Publish Failed" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "(FAILED|ERROR|Exception|> Task|Could not|Caused by)" publish_output.txt | tail -40 >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
+          RESULT="${{ steps.result.outputs.value }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DEPLOYMENT_ID="${{ steps.deployment.outputs.id }}"
+          CENTRAL_STATE="${{ steps.central.outputs.state }}"
+
+          case "$RESULT" in
+            success)
+              echo "## ✅ Maven Central Publish Succeeded" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Version:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+              echo "**Deployment ID:** \`$DEPLOYMENT_ID\`" >> $GITHUB_STEP_SUMMARY
+              echo "**Central status:** $CENTRAL_STATE" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              if [ -s central_purls.txt ]; then
+                echo "**Published components:**" >> $GITHUB_STEP_SUMMARY
+                while IFS= read -r purl; do
+                  echo "- \`$purl\`" >> $GITHUB_STEP_SUMMARY
+                done < central_purls.txt
+              fi
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "[🔍 View on Maven Central](https://central.sonatype.com/search?q=io.github.team401.coppercore)" >> $GITHUB_STEP_SUMMARY
+              ;;
+
+            gradle_failure)
+              echo "## ❌ Publish Failed (Gradle Error)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Version:** \`$VERSION\`  **Run:** [View logs]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "The build failed before or during upload to Central. Gradle error details:" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              grep -E "(FAILED|ERROR|Exception|> Task|Could not|Caused by|Execution failed)" publish_output.txt \
+                | tail -50 >> $GITHUB_STEP_SUMMARY || echo "(no error lines extracted)" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              ;;
+
+            central_failure)
+              echo "## ❌ Publish Failed (Rejected by Maven Central)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Version:** \`$VERSION\`  **Run:** [View logs]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+              echo "**Deployment ID:** \`$DEPLOYMENT_ID\`" >> $GITHUB_STEP_SUMMARY
+              echo "**Central status:** $CENTRAL_STATE" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Gradle reported success, but the Central Portal rejected the deployment:" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              if [ -s central_errors.txt ]; then
+                echo "**Rejection reasons:**" >> $GITHUB_STEP_SUMMARY
+                cat central_errors.txt >> $GITHUB_STEP_SUMMARY
+              fi
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "[🔍 View deployment in Central Portal](https://central.sonatype.com/publishing/deployments)" >> $GITHUB_STEP_SUMMARY
+              ;;
+
+            timeout)
+              echo "## ⚠️ Publish Status Unknown (Central Portal Timed Out)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Version:** \`$VERSION\`  **Run:** [View logs]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+              echo "**Deployment ID:** \`$DEPLOYMENT_ID\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "The deployment was uploaded but did not reach PUBLISHED or FAILED within the polling window." >> $GITHUB_STEP_SUMMARY
+              echo "Check the [Central Portal deployments page](https://central.sonatype.com/publishing/deployments) for the final status." >> $GITHUB_STEP_SUMMARY
+              ;;
+
+            *)
+              echo "## ⚠️ Publish Status Unknown" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Version:** \`$VERSION\`  **Run:** [View logs]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+              ;;
+          esac
 
       - name: Update release notes with publish status
         if: always() && github.event_name == 'release'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
-            const success = '${{ job.status }}' === 'success';
+            const fs = require('fs');
+            const result = '${{ steps.result.outputs.value }}';
+            const version = '${{ steps.version.outputs.version }}';
             const tag = context.ref.replace('refs/tags/', '');
-            const release = await github.rest.repos.getReleaseByTag({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag
-            });
-            const status = success
-              ? '✅ **Maven Central:** Published successfully'
-              : `❌ **Maven Central:** Publish failed — [see run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const deploymentId = '${{ steps.deployment.outputs.id }}';
+            const centralState = '${{ steps.central.outputs.state }}';
+
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+            } catch (e) {
+              core.warning(`Could not find release for tag ${tag}: ${e.message}`);
+              return;
+            }
+
+            let statusLine;
+            if (result === 'success') {
+              let purls = '';
+              try {
+                const purlList = fs.readFileSync('central_purls.txt', 'utf8').trim();
+                if (purlList) purls = '\n' + purlList.split('\n').map(p => `  - \`${p}\``).join('\n');
+              } catch (e) {}
+              statusLine = `✅ **Maven Central:** Published successfully ([run](${runUrl}))${purls}`;
+            } else if (result === 'central_failure') {
+              let errors = '';
+              try {
+                errors = fs.readFileSync('central_errors.txt', 'utf8').trim();
+                if (errors) errors = '\n' + errors;
+              } catch (e) {}
+              statusLine = `❌ **Maven Central:** Rejected by Central Portal — [see run](${runUrl})\n**Deployment:** \`${deploymentId}\`\n**Central status:** ${centralState}${errors}`;
+            } else if (result === 'gradle_failure') {
+              statusLine = `❌ **Maven Central:** Build/upload failed — [see run](${runUrl})`;
+            } else if (result === 'timeout') {
+              statusLine = `⚠️ **Maven Central:** Status unknown (timed out polling) — check [Central Portal](https://central.sonatype.com/publishing/deployments) for deployment \`${deploymentId}\``;
+            } else {
+              statusLine = `⚠️ **Maven Central:** Status unknown — [see run](${runUrl})`;
+            }
+
+            const existingBody = release.data.body || '';
+            const separator = existingBody.trim() ? '\n\n---\n' : '';
             await github.rest.repos.updateRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
               release_id: release.data.id,
-              body: (release.data.body || '') + `\n\n---\n${status}`
+              body: existingBody + separator + statusLine,
             });
 
-      - name: Open issue on failure
-        if: failure() && github.event_name == 'release'
-        uses: actions/github-script@v7
+      - name: Open issue on publish failure
+        if: always() && github.event_name == 'release' && (steps.result.outputs.value == 'gradle_failure' || steps.result.outputs.value == 'central_failure' || steps.result.outputs.value == 'timeout')
+        uses: actions/github-script@v9
         with:
           script: |
+            const fs = require('fs');
+            const result = '${{ steps.result.outputs.value }}';
             const tag = context.ref.replace('refs/tags/', '');
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const deploymentId = '${{ steps.deployment.outputs.id }}';
+            const centralState = '${{ steps.central.outputs.state }}';
+
+            let errors = '';
+            try {
+              errors = fs.readFileSync('central_errors.txt', 'utf8').trim();
+            } catch (e) {}
+
+            const resultLabels = {
+              gradle_failure: 'Build/upload error (Gradle failed before or during upload)',
+              central_failure: `Rejected by Central Portal with status \`${centralState}\``,
+              timeout: 'Status unknown — Central Portal did not reach a terminal state within the polling window',
+            };
+
+            const body = [
+              `The publish workflow failed for release \`${tag}\`.`,
+              '',
+              `**Result:** ${resultLabels[result] || result}`,
+              deploymentId ? `**Deployment ID:** \`${deploymentId}\`` : '',
+              `**[View the failed run](${runUrl})**`,
+              errors ? `\n**Rejection details:**\n${errors}` : '',
+              '',
+              result === 'central_failure'
+                ? '[View deployment in Central Portal](https://central.sonatype.com/publishing/deployments)'
+                : '',
+            ].filter(l => l !== undefined).join('\n');
+
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `🚨 Maven Central publish failed: ${tag}`,
-              body: `Publish workflow failed for \`${tag}\`.\n\n[View failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
-              labels: ['bug']
+              body,
+              labels: ['bug'],
             });
